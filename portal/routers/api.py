@@ -63,7 +63,9 @@ async def provision_listener_token(
         return {"token": token}
 
 
-@router.delete("/events/{event_slug}/rooms/{room_id}/booths/{language_code}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/events/{event_slug}/rooms/{room_id:int}/booths/{language_code}", status_code=status.HTTP_204_NO_CONTENT
+)
 async def delete_booth_by_language(
     request: Request,
     event_slug: str,
@@ -214,6 +216,7 @@ async def create_event_booth(
     "/events/{event_slug}/rooms/{eventyay_room_id}/booths/{language_code}", status_code=status.HTTP_204_NO_CONTENT
 )
 async def delete_event_booth(
+    request: Request,
     event_slug: str,
     eventyay_room_id: str,
     language_code: str,
@@ -221,7 +224,7 @@ async def delete_event_booth(
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
 ):
     """Delete a booth provisioned via API."""
-    _require_access(credentials, token)
+    _require_access(request, credentials, token)
 
     async with get_session() as session:
         # Find the event
@@ -265,7 +268,7 @@ async def list_event_booths(
         # Fallback to checking API Key
         async with get_session() as session:
             key = None
-            if credentials and credentials.scheme.lower() == 'bearer':
+            if credentials and credentials.scheme.lower() == "bearer":
                 key = await verify_api_key(session, credentials.credentials)
             if not key or key.event.slug != event_slug:
                 raise orig_exc
@@ -280,9 +283,10 @@ async def list_event_booths(
         b["label"] = f"{b.get('language_name', b.get('language_code', ''))} (Human)"
 
     async with get_session() as session:
-
-        stmt = select(Event).where(Event.slug == event_slug).options(
-            selectinload(Event.rooms).selectinload(Room.translation_languages)
+        stmt = (
+            select(Event)
+            .where(Event.slug == event_slug)
+            .options(selectinload(Event.rooms).selectinload(Room.translation_languages))
         )
         event = await session.scalar(stmt)
         if event:

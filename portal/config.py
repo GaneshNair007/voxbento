@@ -39,7 +39,9 @@ class Settings(BaseSettings):
     program_ingest_max_rooms: int = 10
     program_ingest_disconnect_grace_secs: float = 15.0
     program_ingest_stall_secs: float = 30.0
-    program_sender_session_ttl_secs: int = 150  # Browser sender publish window; long enough to negotiate, short enough to expire.
+    program_sender_session_ttl_secs: int = (
+        150  # Browser sender publish window; long enough to negotiate, short enough to expire.
+    )
 
     @property
     def effective_jitsi_base_url(self) -> str:
@@ -96,6 +98,11 @@ class Settings(BaseSettings):
             raise RuntimeError(
                 "MEDIAMTX_AUTH_HOOK_SECRET is not set. Configure the same random value for "
                 "the portal and MediaMTX. Generate one with: openssl rand -hex 32"
+            )
+        if not self.booth_access_token:
+            raise RuntimeError(
+                "BOOTH_ACCESS_TOKEN is not set. Configure a secret access token to "
+                "protect legacy API endpoints in production. Generate one with: openssl rand -hex 32"
             )
 
     # Transcription Settings
