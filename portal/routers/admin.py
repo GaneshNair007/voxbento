@@ -9,15 +9,15 @@ import urllib.parse
 from datetime import timedelta
 from pathlib import Path
 
-import httpx
 import pycountry
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from portal import meeting_source
 from portal.auth import (
     get_accessible_event_ids,
     get_admin_flags,
@@ -77,7 +77,7 @@ from portal.database import (
     update_user_active,
 )
 from portal.email import send_role_invite_email
-from portal.globals import _JS_CACHE_BUST, booths, get_http_client
+from portal.globals import _JS_CACHE_BUST, booths
 from portal.models import (
     BoothTranslationLanguage,
     Event,
@@ -87,6 +87,7 @@ from portal.models import (
     User,
     utc_now,
 )
+from portal.program_ingest import room_lock
 from portal.transcription import ALLOWED_MODELS, ProviderConfig, ProviderEnum, get_api_key
 from portal.transcription.worker import start_transcription_worker, stop_transcription_worker
 from portal.translations.constants import TRANSLATION_MODELS, TranslationProviderEnum
@@ -951,9 +952,12 @@ async def admin_delete_api_key(request: Request, event_id: int, key_id: int):
         return {"success": True}
 
 
+# Legacy room-scoped API retained for coordinators and scripts. It drives the
+# same managed meeting agent as the room page, so the reconcile loop owns retries
+# and starts the floor worker once audio arrives.
 @router.post("/api/rooms/{room_id}/floor-transcription/start", dependencies=[Depends(require_room_event_access)])
 async def api_start_floor_transcription(room_id: int):
-    async with get_session() as session:
+    async with room_lock(room_id), get_session() as session:
         room = await get_room_by_id(session, room_id)
         if not room or not room.floor_transcription_enabled:
             raise HTTPException(status_code=400, detail="Floor transcription not enabled or invalid room")
@@ -967,75 +971,13 @@ async def api_start_floor_transcription(room_id: int):
         event = await get_event_by_id(session, room.event_id)
         if not event:
             raise HTTPException(status_code=400, detail="Event not found")
-        event_slug = event.slug
-        clean_name = re.sub("[^a-zA-Z0-9]+", "", room.display_name)
-        room_id_str = f"Voxbento-{event.slug}-{clean_name}"
-        if room.jitsi_url:
-            jitsi_url = room.jitsi_url
-            parsed = urllib.parse.urlparse(room.jitsi_url)
-            internal_parsed = urllib.parse.urlparse(settings.effective_jitsi_internal_base)
-            base_parsed = urllib.parse.urlparse(settings.effective_jitsi_base_url)
-            if parsed.netloc in ("jitsi.voxbento.com", base_parsed.netloc) or parsed.netloc.startswith(
-                ("localhost", "127.0.0.1")
-            ):
-                parsed = parsed._replace(scheme=internal_parsed.scheme, netloc=internal_parsed.netloc)
-                jitsi_url = urllib.parse.urlunparse(parsed)
-            else:
-                jitsi_url = room.jitsi_url
-        else:
-            jitsi_url = f"{settings.effective_jitsi_internal_base}/{room_id_str}"
-    try:
-        client = get_http_client()
-        resp = await client.post(
-            f"{settings.floor_bot_base}/start",
-            json={
-                "event_slug": event_slug,
-                "room_id": room_id,
-                "jitsi_url": jitsi_url,
-                "mediamtx_rtsp_base": settings.mediamtx_rtsp_base,
-            },
-            timeout=10.0,
-        )
-        resp.raise_for_status()
-    except Exception as e:
-        logger.error(f"Failed to start floor-bot: {e}")
-        raise HTTPException(status_code=502, detail="Bot service connection failed or access was revoked upstream.")
-    # Ownership may change while the bot's slow browser startup is in flight.
-    async with get_session() as session:
-        current_room = await get_room_by_id(session, room_id)
-        if not current_room or current_room.floor_source != "jitsi_bot":
-            try:
-                await client.post(
-                    f"{settings.floor_bot_base}/stop", json={"event_slug": event_slug, "room_id": room_id}
-                )
-            except httpx.HTTPError:
-                logger.warning("Failed to clean up floor-bot after ownership changed room_id=%s", room_id)
-            raise HTTPException(status_code=409, detail="Floor source changed during bot startup")
-    try:
-        api_key = get_api_key(event, ProviderEnum(room.floor_transcription_provider))
-        config = ProviderConfig(api_key=api_key)
-        await start_transcription_worker(
-            event_slug=event_slug,
-            language_code="floor",
-            booth_id=make_booth_id(event_slug, room_id, "floor"),
-            broadcast_callback=broadcast_transcription,
-            provider=room.floor_transcription_provider,
-            model_size=room.floor_transcription_model,
-            config=config,
-            transcription_language=room.floor_language_code,
-            room_id=room_id,
-        )
-    except Exception as e:
-        logger.error(f"Failed to start transcription worker: {e}")
-        client = get_http_client()
-        await client.post(f"{settings.floor_bot_base}/stop", json={"event_slug": event_slug, "room_id": room_id})
-        raise HTTPException(status_code=500, detail=f"Failed to start transcription worker: {e}")
+        await meeting_source.connect(room, event, None, confirm_source_change=False)
     return {"status": "started"}
 
 
 @router.post("/api/rooms/{room_id}/floor-transcription/stop", dependencies=[Depends(require_room_event_access)])
 async def api_stop_floor_transcription(room_id: int):
-    async with get_session() as session:
+    async with room_lock(room_id), get_session() as session:
         room = await get_room_by_id(session, room_id)
         if not room:
             raise HTTPException(status_code=400, detail="Invalid room")
@@ -1046,15 +988,10 @@ async def api_stop_floor_transcription(room_id: int):
         event = await get_event_by_id(session, room.event_id)
         if not event:
             raise HTTPException(status_code=400, detail="Event not found")
-        event_slug = event.slug
-    try:
-        client = get_http_client()
-        await client.post(
-            f"{settings.floor_bot_base}/stop", json={"event_slug": event_slug, "room_id": room_id}, timeout=15.0
-        )
-    except Exception as e:
-        logger.error(f"Failed to stop floor-bot: {e}")
-    await stop_transcription_worker(make_booth_id(event_slug, room_id, "floor"))
+        stopped = await meeting_source.disconnect(room, event)
+    if not stopped:
+        # Mirror the owner route: the agent may still be in the meeting until reconcile retries.
+        return JSONResponse({"status": "stopping", "cleanup_pending": True}, status_code=202)
     return {"status": "stopped"}
 
 
@@ -1067,25 +1004,12 @@ async def api_floor_transcription_status(room_id: int):
         event = await get_event_by_id(session, room.event_id)
         if not event:
             raise HTTPException(status_code=404, detail="Event not found")
-        event_slug = event.slug
-    running = False
-    stage = "stopped"
-    bot_reachable = True
-    try:
-        client = get_http_client()
-        resp = await client.get(f"{settings.floor_bot_base}/status", timeout=5.0)
-        resp.raise_for_status()
-        data = resp.json()
-        process_key = f"{event_slug}-{room_id}"
-        info = (data.get("active_rooms") or {}).get(process_key)
-        if info:
-            stage = info.get("stage", info.get("state", "unknown"))
-            running = info.get("state") == "healthy"
-    except Exception as e:
-        logger.error(f"Failed to query floor-bot status: {e}")
-        bot_reachable = False
-        stage = "unknown"
-    return {"running": running, "stage": stage, "bot_reachable": bot_reachable}
+        body = meeting_source.status(room)
+    # Keep the pre-managed fields with their original meaning (raw bot stage such as
+    # launching, in_meeting or dead) so existing scripts and monitors keep working;
+    # the managed lifecycle is reported separately in "state".
+    body["bot_reachable"], body["stage"], body["running"] = await meeting_source.bot_stage(event.slug, room.id)
+    return body
 
 
 @router.post("/admin/events/{event_id}/rooms/{room_id}/delete", dependencies=[Depends(require_admin)])
