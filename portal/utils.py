@@ -122,14 +122,9 @@ def _require_access(
     token_query: str | None = None,
 ) -> None:
     """Allow request if access token is unset in debug mode, or if a valid JWT or legacy token is provided."""
-    if not settings.booth_access_token:
-        if not settings.debug:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="BOOTH_ACCESS_TOKEN is not configured on this server.",
-            )
-        return
     if credentials is not None:
+        if settings.booth_access_token and credentials.credentials == settings.booth_access_token:
+            return
         try:
             payload = decode_token(credentials.credentials)
             if payload.get("role") == "listener":
@@ -139,17 +134,38 @@ def _require_access(
             return
         except pyjwt.InvalidTokenError:
             pass
-    if token_query and token_query == settings.booth_access_token:
+    if token_query and settings.booth_access_token and token_query == settings.booth_access_token:
         return
 
     # Cookie Fallback
-    from portal.auth import get_booth_session
+    if "headers" in request.scope:
+        from portal.auth import get_booth_session
 
-    payload = get_booth_session(request)
-    if payload:
-        if payload.get("role") == "listener":
+        payload = get_booth_session(request)
+        if payload:
+            if payload.get("role") == "listener":
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN, detail="Listener tokens cannot be used for this API."
+                )
+            return
+
+        user_cookie = request.cookies.get("user_token")
+        if user_cookie:
+            try:
+                payload = decode_token(user_cookie)
+                if payload.get("role") == "listener":
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN, detail="Listener tokens cannot be used for this API."
+                    )
+                return
+            except pyjwt.InvalidTokenError:
+                pass
+
+    if not settings.booth_access_token:
+        if not settings.debug:
             raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN, detail="Listener tokens cannot be used for this API."
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="BOOTH_ACCESS_TOKEN is not configured on this server.",
             )
         return
 

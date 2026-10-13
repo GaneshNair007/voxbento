@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import jwt as pyjwt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.exc import ObjectDeletedError, StaleDataError
 
-from portal.auth import create_embed_token, create_listener_token, security
+from portal.auth import create_embed_token, create_listener_token, decode_token, security
 from portal.booth_identity import make_booth_id, make_mediamtx_path
 from portal.config import settings
 from portal.database import (
@@ -13,12 +16,13 @@ from portal.database import (
     delete_booth,
     get_event_by_slug,
     get_session,
+    get_user_by_id,
     list_rooms_for_event,
     log_usage_metric,
     verify_api_key,
 )
 from portal.globals import booths
-from portal.models import DBBooth, Event, Room
+from portal.models import DBBooth, Event, EventMembership, Room, RoomMembership
 from portal.rate_limit import check_rate_limit
 from portal.schemas.booth import CreateBoothRequest
 from portal.transcription import ProviderConfig, ProviderEnum, get_api_key
@@ -63,6 +67,101 @@ async def provision_listener_token(
         return {"token": token}
 
 
+async def _verify_event_deletion_access(
+    session: AsyncSession,
+    request: Request,
+    event_id: int,
+    room_id: int | None = None,
+    credentials: HTTPAuthorizationCredentials | None = None,
+    token: str = "",
+) -> None:
+    """Verify that caller has permission to delete booths in this event/room."""
+    # Master token configured on server grants global admin access
+    if settings.booth_access_token:
+        if (credentials and credentials.credentials == settings.booth_access_token) or (
+            token and token == settings.booth_access_token
+        ):
+            return
+
+    has_headers = "headers" in request.scope
+    user_cookie = request.cookies.get("user_token") if has_headers else None
+    session_cookie = request.cookies.get("session_token") if has_headers else None
+
+    # Debug bypass when no token is configured and no credentials/session are supplied
+    if settings.debug and not settings.booth_access_token:
+        if not credentials and not token and not user_cookie and not session_cookie:
+            return
+
+    # Extract user token from Bearer credentials or cookie
+    user_jwt = None
+    if credentials is not None:
+        user_jwt = credentials.credentials
+    elif user_cookie:
+        user_jwt = user_cookie
+
+    if user_jwt:
+        try:
+            payload = decode_token(user_jwt)
+        except pyjwt.InvalidTokenError:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid auth token.")
+
+        if payload.get("role") in ("listener", "interpreter", "participant"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="Participant tokens cannot delete booths."
+            )
+
+        sub = payload.get("sub")
+        if sub:
+            try:
+                user_id = int(sub)
+                user = await get_user_by_id(session, user_id)
+            except (ValueError, TypeError):
+                user = None
+
+            if user and user.is_active:
+                if user.is_admin or getattr(user, "is_super_admin", False):
+                    return
+
+                # Check EventMembership (event_owner)
+                is_owner = await session.scalar(
+                    select(EventMembership.id).where(
+                        EventMembership.user_id == user.id,
+                        EventMembership.event_id == event_id,
+                        EventMembership.role == "event_owner",
+                    )
+                )
+                if is_owner:
+                    return
+
+                # Check RoomMembership (room_coordinator)
+                if room_id is not None:
+                    is_coordinator = await session.scalar(
+                        select(RoomMembership.id).where(
+                            RoomMembership.user_id == user.id,
+                            RoomMembership.room_id == room_id,
+                            RoomMembership.role == "room_coordinator",
+                        )
+                    )
+                    if is_coordinator:
+                        return
+
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Forbidden: User lacks permissions to delete booths for this event.",
+                )
+
+    # Participant cookie fallback (session_token)
+    if session_cookie:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Participant tokens cannot delete booths.")
+
+    # If it reached here without matching master token or valid user role:
+    if not settings.debug:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: User lacks permissions to delete booths for this event.",
+        )
+
+
 @router.delete(
     "/events/{event_slug}/rooms/{room_id:int}/booths/{language_code}", status_code=status.HTTP_204_NO_CONTENT
 )
@@ -72,27 +171,53 @@ async def delete_booth_by_language(
     room_id: int,
     language_code: str,
     token: str = Query(""),
+    is_external: bool = Query(False),
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
 ):
     """Delete a booth from an event."""
     _require_access(request, credentials, token)
 
-    booth_id = make_booth_id(event_slug, room_id, language_code)
-    await stop_transcription_worker(booth_id)
-
-    # Delete from DB
     async with get_session() as session:
-        stmt = (
-            select(DBBooth)
-            .join(Event)
-            .where(Event.slug == event_slug, DBBooth.room_id == room_id, DBBooth.language_code == language_code)
-        )
-        db_booth = await session.scalar(stmt)
-        if db_booth:
-            await delete_booth(session, db_booth.id)
+        event = await session.scalar(select(Event).where(Event.slug == event_slug))
+        if not event:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
 
-    # Remove from in memory state
-    await booths.remove_booth(event_slug, room_id, language_code)
+        # Disambiguate numeric room IDs:
+        # If is_external is True, look up Room by eventyay_room_id == str(room_id).
+        # Otherwise, check internal Room.id == room_id first; if not found, fall back to eventyay_room_id == str(room_id).
+        room = None
+        if is_external:
+            room = await session.scalar(
+                select(Room).where(Room.event_id == event.id, Room.eventyay_room_id == str(room_id))
+            )
+        else:
+            room = await session.scalar(select(Room).where(Room.event_id == event.id, Room.id == room_id))
+            if not room:
+                room = await session.scalar(
+                    select(Room).where(Room.event_id == event.id, Room.eventyay_room_id == str(room_id))
+                )
+
+        if not room:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Room not found")
+
+        await _verify_event_deletion_access(session, request, event.id, room.id, credentials, token)
+
+        db_booth = await session.scalar(
+            select(DBBooth).where(
+                DBBooth.event_id == event.id,
+                DBBooth.room_id == room.id,
+                DBBooth.language_code == language_code,
+            )
+        )
+        if db_booth:
+            try:
+                await delete_booth(session, db_booth.id)
+            except (StaleDataError, ObjectDeletedError):
+                pass
+
+        booth_id = make_booth_id(event_slug, room.id, language_code)
+        await stop_transcription_worker(booth_id)
+        await booths.remove_booth(event_slug, room.id, language_code)
 
 
 @router.post("/events/{event_slug}/booths", status_code=status.HTTP_201_CREATED)
@@ -213,6 +338,10 @@ async def create_event_booth(
 
 
 @router.delete(
+    "/events/{event_slug}/eventyay-rooms/{eventyay_room_id}/booths/{language_code}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+@router.delete(
     "/events/{event_slug}/rooms/{eventyay_room_id}/booths/{language_code}", status_code=status.HTTP_204_NO_CONTENT
 )
 async def delete_event_booth(
@@ -223,35 +352,38 @@ async def delete_event_booth(
     token: str = Query(""),
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
 ):
-    """Delete a booth provisioned via API."""
+    """Delete a booth provisioned via API using external Eventyay room ID."""
     _require_access(request, credentials, token)
 
     async with get_session() as session:
-        # Find the event
-        event_query = await session.execute(select(Event).where(Event.slug == event_slug))
-        event = event_query.scalar_one_or_none()
+        event = await session.scalar(select(Event).where(Event.slug == event_slug))
         if not event:
-            raise HTTPException(status_code=404, detail="Event not found")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Event not found")
 
-        # Find the room
-        room_query = await session.execute(
+        room = await session.scalar(
             select(Room).where(Room.event_id == event.id, Room.eventyay_room_id == eventyay_room_id)
         )
-        room = room_query.scalar_one_or_none()
         if not room:
-            raise HTTPException(status_code=404, detail="Room not found")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Room not found")
 
-        # Find the booth
-        booth_query = await session.execute(
+        await _verify_event_deletion_access(session, request, event.id, room.id, credentials, token)
+
+        db_booth = await session.scalar(
             select(DBBooth).where(
-                DBBooth.event_id == event.id, DBBooth.room_id == room.id, DBBooth.language_code == language_code
+                DBBooth.event_id == event.id,
+                DBBooth.room_id == room.id,
+                DBBooth.language_code == language_code,
             )
         )
-        booth = booth_query.scalar_one_or_none()
+        if db_booth:
+            try:
+                await delete_booth(session, db_booth.id)
+            except (StaleDataError, ObjectDeletedError):
+                pass
 
-        if booth:
-            await session.delete(booth)
-            await session.flush()
+        booth_id = make_booth_id(event_slug, room.id, language_code)
+        await stop_transcription_worker(booth_id)
+        await booths.remove_booth(event_slug, room.id, language_code)
 
 
 @router.get("/events/{event_slug}/booths")

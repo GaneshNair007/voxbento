@@ -8,6 +8,7 @@ import os
 # Force auth off for all tests — setdefault would not override an already-set env var,
 # so use an unconditional assignment to guarantee a deterministic baseline.
 os.environ["BOOTH_ACCESS_TOKEN"] = ""
+os.environ["DEBUG"] = "true"
 
 import pytest
 from fastapi.testclient import TestClient

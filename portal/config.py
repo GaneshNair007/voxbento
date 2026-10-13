@@ -99,10 +99,11 @@ class Settings(BaseSettings):
                 "MEDIAMTX_AUTH_HOOK_SECRET is not set. Configure the same random value for "
                 "the portal and MediaMTX. Generate one with: openssl rand -hex 32"
             )
-        if not self.booth_access_token:
+        if self.booth_access_token in {"change-me", "secret", "your-secret-key"}:
             raise RuntimeError(
-                "BOOTH_ACCESS_TOKEN is not set. Configure a secret access token to "
-                "protect legacy API endpoints in production. Generate one with: openssl rand -hex 32"
+                "BOOTH_ACCESS_TOKEN is set to a known-weak default value. "
+                "Configure a secret access token to protect legacy API endpoints in production. "
+                "Generate one with: openssl rand -hex 32"
             )
 
     # Transcription Settings
